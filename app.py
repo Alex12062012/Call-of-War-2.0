@@ -1,54 +1,19 @@
-from flask import Flask, render_template_string, request, redirect, url_for, session
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify
 import hashlib, json, os, random
+from collections import deque
 
 app = Flask(__name__)
-app.secret_key = "openfront_secret_CHANGE_IN_PROD"
+app.secret_key = "openfront_strategy_CHANGE_IN_PROD"
 
 # ================== CONFIG ==================
-USERS_FILE = "openfront_users.json"
-SAVES_DIR = "openfront_saves"
+USERS_FILE = "strategy_users.json"
+SAVES_DIR = "strategy_saves"
 os.makedirs(SAVES_DIR, exist_ok=True)
 
-# ================== DATA ==================
-seigneurs = [
-    {"nom": "Baron Noir", "unites": ["Archer", "Fantassin"], "recompense": 200, "niveau": 3},
-    {"nom": "Comte Sanglant", "unites": ["Chevalier", "Mage"], "recompense": 400, "niveau": 5},
-    {"nom": "Duc des Ombres", "unites": ["Dragon", "Paladin"], "recompense": 800, "niveau": 8},
-    {"nom": "Roi Maudit", "unites": ["Titan", "Archimage"], "recompense": 1500, "niveau": 12},
-    {"nom": "Empereur du Chaos", "unites": ["Démon", "Ange Noir"], "recompense": 5000, "niveau": 20}
-]
-
-unite_stats = {
-    "Archer": {"pv": 80, "attaque": 25, "rarete": "Commun"},
-    "Fantassin": {"pv": 100, "attaque": 20, "rarete": "Commun"},
-    "Chevalier": {"pv": 120, "attaque": 35, "rarete": "Rare"},
-    "Mage": {"pv": 90, "attaque": 40, "rarete": "Rare"},
-    "Dragon": {"pv": 150, "attaque": 50, "rarete": "Épique"},
-    "Paladin": {"pv": 140, "attaque": 45, "rarete": "Épique"},
-    "Titan": {"pv": 180, "attaque": 55, "rarete": "Légendaire"},
-    "Archimage": {"pv": 130, "attaque": 60, "rarete": "Légendaire"},
-    "Démon": {"pv": 200, "attaque": 65, "rarete": "Mythique"},
-    "Ange Noir": {"pv": 170, "attaque": 70, "rarete": "Mythique"}
-}
-
-PRIX_VENTE = {"Commun": 50, "Rare": 150, "Épique": 400, "Légendaire": 900, "Mythique": 2000}
-BONUS_ATK = {"Commun": 0, "Rare": 5, "Épique": 10, "Légendaire": 20, "Mythique": 30}
-MAX_ARMEE = 6
-
-LANGUES = {
-    "fr": {"welcome": "Bienvenue {nom}", "login": "Connexion", "register": "S'inscrire", 
-           "menu": "Royaume", "fight": "⚔️ Conquête", "recruit": "🎲 Recruter (60 or)",
-           "army": "🛡️ Armée", "sell": "💰 Vendre", "heal": "❤️ Soigner (40 or)",
-           "save": "💾 Sauvegarder", "quit": "🚪 Quitter", "back": "← Retour",
-           "gold": "Or", "progress": "Seigneurs vaincus", "choose_unit": "Choisis ton unité",
-           "attack": "Attaquer", "heal_action": "Soigner", "victory": "🏆 VICTOIRE", "defeat": "💀 Défaite"},
-    "en": {"welcome": "Welcome {nom}", "login": "Login", "register": "Register",
-           "menu": "Kingdom", "fight": "⚔️ Conquest", "recruit": "🎲 Recruit (60 gold)",
-           "army": "🛡️ Army", "sell": "💰 Sell", "heal": "❤️ Heal (40 gold)",
-           "save": "💾 Save", "quit": "🚪 Quit", "back": "← Back",
-           "gold": "Gold", "progress": "Lords defeated", "choose_unit": "Choose unit",
-           "attack": "Attack", "heal_action": "Heal", "victory": "🏆 VICTORY", "defeat": "💀 DEFEAT"}
-}
+MAP_SIZE = 50
+COLORS = ["#FF6B6B", "#4ECDC4", "#45B7D1", "#FFA07A", "#98D8C8", "#F7DC6F", "#BB8FCE", "#85C1E2", "#F8B739", "#52BE80"]
+BOT_NAMES = ["Empire Rouge", "Royaume Bleu", "Nation Verte", "Alliance Jaune", "Confédération Violette", 
+             "Coalition Orange", "Fédération Rose", "Union Turquoise", "République Cyan", "Ligue Magenta"]
 
 # ================== UTILS ==================
 def hash_pw(pw):
@@ -60,27 +25,221 @@ def load_users():
 def save_users(u):
     json.dump(u, open(USERS_FILE, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 
+def generate_map():
+    """Génère une carte 50x50 avec terrain (0=mer, 1=terre) en utilisant perlin-like"""
+    terrain = [[0 for _ in range(MAP_SIZE)] for _ in range(MAP_SIZE)]
+    
+    # Génération simple par clusters
+    num_continents = random.randint(3, 6)
+    for _ in range(num_continents):
+        cx, cy = random.randint(5, MAP_SIZE-5), random.randint(5, MAP_SIZE-5)
+        size = random.randint(8, 15)
+        
+        for x in range(max(0, cx-size), min(MAP_SIZE, cx+size)):
+            for y in range(max(0, cy-size), min(MAP_SIZE, cy+size)):
+                dist = ((x-cx)**2 + (y-cy)**2)**0.5
+                if dist < size and random.random() > 0.2:
+                    terrain[y][x] = 1
+    
+    return terrain
+
+def init_game():
+    """Initialise une nouvelle partie"""
+    terrain = generate_map()
+    
+    # Trouver des positions de spawn sur terre
+    land_positions = [(x, y) for y in range(MAP_SIZE) for x in range(MAP_SIZE) if terrain[y][x] == 1]
+    random.shuffle(land_positions)
+    
+    players = []
+    ownership = [[-1 for _ in range(MAP_SIZE)] for _ in range(MAP_SIZE)]
+    cities = {}
+    
+    # Player humain (ID 0)
+    if land_positions:
+        px, py = land_positions.pop()
+        players.append({
+            "id": 0,
+            "name": session.get('username', 'Joueur'),
+            "color": "#FF0000",
+            "troops": 1000,
+            "gold": 500,
+            "is_bot": False,
+            "territory_count": 1
+        })
+        ownership[py][px] = 0
+    
+    # 10 Bots
+    for i in range(10):
+        if not land_positions:
+            break
+        bx, by = land_positions.pop()
+        players.append({
+            "id": i+1,
+            "name": BOT_NAMES[i],
+            "color": COLORS[i],
+            "troops": 1000,
+            "gold": 500,
+            "is_bot": True,
+            "territory_count": 1,
+            "last_action": 0
+        })
+        ownership[by][bx] = i+1
+    
+    return {
+        "terrain": terrain,
+        "ownership": ownership,
+        "players": players,
+        "cities": cities,
+        "turn": 0,
+        "selected_cell": None
+    }
+
+def get_neighbors(x, y):
+    """Retourne les voisins d'une cellule"""
+    neighbors = []
+    for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
+        nx, ny = x + dx, y + dy
+        if 0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE:
+            neighbors.append((nx, ny))
+    return neighbors
+
+def count_territory(game, player_id):
+    """Compte le territoire d'un joueur"""
+    count = 0
+    for row in game['ownership']:
+        count += sum(1 for cell in row if cell == player_id)
+    return count
+
+def bot_ai(game, bot_id):
+    """IA des bots - stratégie simple mais efficace"""
+    bot = game['players'][bot_id]
+    ownership = game['ownership']
+    terrain = game['terrain']
+    
+    # Gagner des troupes par tour (1 par territoire)
+    bot['territory_count'] = count_territory(game, bot_id)
+    bot['troops'] += bot['territory_count']
+    bot['gold'] += bot['territory_count'] // 10
+    
+    # Stratégie: expansion intelligente
+    my_cells = [(x, y) for y in range(MAP_SIZE) for x in range(MAP_SIZE) if ownership[y][x] == bot_id]
+    
+    if not my_cells:
+        return
+    
+    # 1. Construire des villes sur les cases stratégiques (20% de chance)
+    if bot['gold'] >= 300 and random.random() < 0.2:
+        strategic_cells = [c for c in my_cells if len([n for n in get_neighbors(*c) if ownership[n[1]][n[0]] != bot_id]) >= 2]
+        if strategic_cells:
+            city_pos = random.choice(strategic_cells)
+            city_key = f"{city_pos[0]},{city_pos[1]}"
+            if city_key not in game['cities']:
+                game['cities'][city_key] = {"owner": bot_id, "level": 1}
+                bot['gold'] -= 300
+                bot['troops'] += 100
+                return
+    
+    # 2. Attaquer les territoires adjacents faibles
+    targets = []
+    for cx, cy in my_cells:
+        for nx, ny in get_neighbors(cx, cy):
+            target_owner = ownership[ny][nx]
+            if target_owner != bot_id and target_owner != -1:
+                # Vérifier si on peut attaquer
+                target_troops = game['players'][target_owner]['troops']
+                if bot['troops'] > target_troops * 0.3:  # On attaque si on a 30% de leurs troupes
+                    targets.append((nx, ny, target_owner, cx, cy))
+    
+    if targets and bot['troops'] > 200:
+        # Attaquer la cible la plus faible
+        targets.sort(key=lambda t: game['players'][t[2]]['troops'])
+        tx, ty, target_id, fx, fy = targets[0]
+        
+        # Vérifier si on doit envoyer un bateau
+        use_boat = terrain[fy][fx] == 1 and terrain[ty][tx] == 1 and not are_connected_by_land(game, fx, fy, tx, ty)
+        
+        attack_troops = min(bot['troops'] // 2, 300)
+        if use_boat and bot['gold'] >= 50:
+            bot['gold'] -= 50
+            perform_attack(game, bot_id, fx, fy, tx, ty, attack_troops)
+        elif not use_boat:
+            perform_attack(game, bot_id, fx, fy, tx, ty, attack_troops)
+    
+    # 3. Expansion sur territoires neutres
+    elif bot['troops'] > 100:
+        neutral_targets = []
+        for cx, cy in my_cells:
+            for nx, ny in get_neighbors(cx, cy):
+                if ownership[ny][nx] == -1 and terrain[ny][nx] == 1:
+                    neutral_targets.append((nx, ny, cx, cy))
+        
+        if neutral_targets:
+            tx, ty, fx, fy = random.choice(neutral_targets)
+            ownership[ty][tx] = bot_id
+            bot['troops'] -= 50
+
+def are_connected_by_land(game, x1, y1, x2, y2):
+    """BFS pour vérifier si deux cases terrestres sont connectées"""
+    if game['terrain'][y1][x1] == 0 or game['terrain'][y2][x2] == 0:
+        return False
+    
+    visited = set()
+    queue = deque([(x1, y1)])
+    visited.add((x1, y1))
+    
+    while queue:
+        x, y = queue.popleft()
+        if x == x2 and y == y2:
+            return True
+        
+        for nx, ny in get_neighbors(x, y):
+            if (nx, ny) not in visited and game['terrain'][ny][nx] == 1:
+                visited.add((nx, ny))
+                queue.append((nx, ny))
+    
+    return False
+
+def perform_attack(game, attacker_id, fx, fy, tx, ty, troops):
+    """Effectue une attaque"""
+    defender_id = game['ownership'][ty][tx]
+    attacker = game['players'][attacker_id]
+    
+    if defender_id == -1:
+        # Territoire neutre
+        game['ownership'][ty][tx] = attacker_id
+        attacker['troops'] -= min(troops, attacker['troops'])
+    else:
+        # Combat
+        defender = game['players'][defender_id]
+        
+        # Ratio de victoire basé sur les troupes
+        attack_power = min(troops, attacker['troops'])
+        defense_power = defender['troops'] * 0.3  # Le défenseur a un bonus
+        
+        if attack_power > defense_power:
+            # Victoire de l'attaquant
+            game['ownership'][ty][tx] = attacker_id
+            attacker['troops'] -= int(attack_power * 0.7)
+            defender['troops'] -= int(defense_power * 0.5)
+            
+            # Supprimer la ville si elle existe
+            city_key = f"{tx},{ty}"
+            if city_key in game['cities']:
+                del game['cities'][city_key]
+        else:
+            # Victoire du défenseur
+            attacker['troops'] -= int(attack_power * 0.8)
+            defender['troops'] -= int(attack_power * 0.3)
+
 def load_game(user):
     if not user:
-        return {"or": 200, "armee": [], "seigneur_actuel": 0}
-    f = os.path.join(SAVES_DIR, f"{user}.json")
-    return json.load(open(f, encoding='utf-8')) if os.path.exists(f) else {"or": 200, "armee": [], "seigneur_actuel": 0}
+        return init_game()
+    f = os.path.join(SAVES_DIR, f"{user}_strategy.json")
+    return json.load(open(f, encoding='utf-8')) if os.path.exists(f) else init_game()
 
 def save_game(user, data):
-    json.dump(data, open(os.path.join(SAVES_DIR, f"{user}.json"), 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
-
-def get_state():
-    if 'username' not in session:
-        return {"or": 200, "armee": [], "seigneur_actuel": 0}
-    if 'game_state' not in session:
-        session['game_state'] = load_game(session.get('username', ''))
-    return session['game_state']
-
-def update_state(updates):
-    state = get_state()
-    state.update(updates)
-    session['game_state'] = state
-    session.modified = True
+    json.dump(data, open(os.path.join(SAVES_DIR, f"{user}_strategy.json"), 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 
 # ================== STYLES ==================
 BASE_STYLE = """
@@ -88,132 +247,143 @@ BASE_STYLE = """
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
     font-family: 'Segoe UI', Tahoma, sans-serif;
-    background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
-    min-height: 100vh;
-    padding: 20px;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    color: white;
+    overflow: hidden;
 }
 .container {
-    max-width: 900px;
-    margin: 0 auto;
-    background: rgba(255, 255, 255, 0.95);
-    border-radius: 20px;
-    padding: 40px;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+    display: flex;
+    height: 100vh;
 }
-h1 { color: #2c3e50; margin-bottom: 20px; text-align: center; }
+.sidebar {
+    width: 300px;
+    background: rgba(0,0,0,0.5);
+    padding: 20px;
+    overflow-y: auto;
+}
+.map-container {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+.game-map {
+    display: grid;
+    grid-template-columns: repeat(50, 12px);
+    gap: 0;
+    border: 2px solid #fff;
+    background: #000;
+}
+.cell {
+    width: 12px;
+    height: 12px;
+    border: 1px solid rgba(255,255,255,0.1);
+    cursor: pointer;
+    transition: all 0.2s;
+}
+.cell:hover {
+    transform: scale(1.3);
+    z-index: 10;
+    border: 2px solid white;
+}
+.cell.sea { background: #1e3a8a; }
+.cell.land { background: #22c55e; }
+.cell.city {
+    background-image: radial-gradient(circle, #ffd700 0%, transparent 70%);
+}
 .btn {
-    background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     color: white;
     border: none;
-    padding: 15px 30px;
-    font-size: 1.1em;
-    border-radius: 10px;
+    padding: 10px 20px;
+    border-radius: 5px;
     cursor: pointer;
-    text-decoration: none;
-    display: inline-block;
-    margin: 5px;
-    transition: transform 0.2s;
-}
-.btn:hover { transform: translateY(-3px); }
-.btn-secondary { background: linear-gradient(135deg, #3498db 0%, #2980b9 100%); }
-.stat { text-align: center; margin: 20px 0; font-size: 1.3em; color: #555; }
-.unit-card {
-    background: white;
-    border-radius: 15px;
-    padding: 20px;
-    margin: 10px 0;
-    box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-    border-left: 5px solid #e74c3c;
-}
-.health-bar {
-    background: #ddd;
-    height: 20px;
-    border-radius: 10px;
-    overflow: hidden;
-    margin: 10px 0;
-}
-.health-fill {
-    background: linear-gradient(90deg, #e74c3c 0%, #c0392b 100%);
-    height: 100%;
-    transition: width 0.3s;
-}
-input {
     width: 100%;
-    padding: 15px;
+    margin: 5px 0;
+    font-size: 0.9em;
+}
+.btn:hover { opacity: 0.8; }
+.btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.stat {
+    background: rgba(255,255,255,0.1);
+    padding: 10px;
+    border-radius: 5px;
     margin: 10px 0;
-    border: 2px solid #ddd;
-    border-radius: 10px;
-    font-size: 1em;
 }
-.msg {
-    padding: 15px;
-    border-radius: 10px;
-    margin: 15px 0;
-    text-align: center;
-    font-weight: bold;
+.player-item {
+    padding: 8px;
+    margin: 5px 0;
+    border-radius: 5px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
 }
-.msg-success { background: #d4edda; color: #155724; }
-.msg-error { background: #f8d7da; color: #721c24; }
-.rarity-Commun { border-left-color: #95a5a6; }
-.rarity-Rare { border-left-color: #3498db; }
-.rarity-Épique { border-left-color: #9b59b6; }
-.rarity-Légendaire { border-left-color: #f39c12; }
-.rarity-Mythique { border-left-color: #e74c3c; }
+h2 { font-size: 1.2em; margin: 15px 0 10px 0; }
+.modal {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: #1a1a2e;
+    padding: 30px;
+    border-radius: 10px;
+    border: 2px solid #667eea;
+    z-index: 1000;
+    min-width: 400px;
+}
+.overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0,0,0,0.8);
+    z-index: 999;
+}
 </style>
 """
 
 # ================== ROUTES ==================
-@app.route("/", methods=["GET", "POST"])
+@app.route("/")
 def home():
-    if request.method == "POST":
-        session["lang"] = request.form["lang"]
-        return redirect(url_for("login_page"))
-    
     return render_template_string(BASE_STYLE + """
-    <body><div class="container" style="text-align:center;">
-        <h1>⚔️ Kingdom Conquest</h1>
-        <p style="font-size:1.2em;margin:20px 0;">Choisir la langue / Choose language</p>
-        <form method="post">
-            <button class="btn" name="lang" value="fr">🇫🇷 Français</button>
-            <button class="btn" name="lang" value="en">🇬🇧 English</button>
-        </form>
+    <body><div class="container" style="align-items:center;justify-content:center;flex-direction:column;">
+        <h1 style="font-size:3em;margin-bottom:20px;">🎮 OpenFront Strategy</h1>
+        <p style="font-size:1.2em;margin:20px 0;">Jeu de stratégie en temps réel - Conquête territoriale</p>
+        <a href="{{url_for('login_page')}}"><button class="btn" style="width:300px;">🚀 Commencer</button></a>
     </div></body>
     """)
 
 @app.route("/login", methods=["GET", "POST"])
 def login_page():
-    lang = session.get("lang", "fr")
-    T = LANGUES[lang]
     msg = ""
-    
     if request.method == "POST":
         user, pw = request.form["username"], request.form["password"]
         users = load_users()
         if user in users and users[user]["password"] == hash_pw(pw):
             session['username'] = user
-            session['game_state'] = load_game(user)
-            return redirect(url_for("menu"))
+            return redirect(url_for("game"))
         msg = "❌ Identifiants invalides"
     
     return render_template_string(BASE_STYLE + """
-    <body><div class="container">
-        <h1>🏰 {{T['login']}}</h1>
-        {% if msg %}<p class="msg msg-error">{{msg}}</p>{% endif %}
-        <form method="post">
-            <input name="username" placeholder="Nom d'utilisateur" required>
-            <input name="password" type="password" placeholder="Mot de passe" required>
-            <button class="btn" type="submit">{{T['login']}}</button>
+    <body><div class="container" style="align-items:center;justify-content:center;flex-direction:column;">
+        <h1>🔐 Connexion</h1>
+        {% if msg %}<p style="color:#ff6b6b;margin:10px 0;">{{msg}}</p>{% endif %}
+        <form method="post" style="width:300px;">
+            <input name="username" placeholder="Nom d'utilisateur" required 
+                   style="width:100%;padding:10px;margin:10px 0;border-radius:5px;border:none;">
+            <input name="password" type="password" placeholder="Mot de passe" required
+                   style="width:100%;padding:10px;margin:10px 0;border-radius:5px;border:none;">
+            <button class="btn" type="submit">Se connecter</button>
         </form>
-        <a href="{{url_for('signup_page')}}"><button class="btn btn-secondary">{{T['register']}}</button></a>
+        <a href="{{url_for('signup_page')}}"><button class="btn" style="width:300px;background:#f5576c;">Créer un compte</button></a>
     </div></body>
-    """, T=T, msg=msg)
+    """, msg=msg)
 
 @app.route("/signup", methods=["GET", "POST"])
 def signup_page():
-    lang = session.get("lang", "fr")
-    T = LANGUES[lang]
     msg = ""
-    
     if request.method == "POST":
         user, pw = request.form["username"], request.form["password"]
         users = load_users()
@@ -225,423 +395,289 @@ def signup_page():
             return redirect(url_for("login_page"))
     
     return render_template_string(BASE_STYLE + """
-    <body><div class="container">
-        <h1>📝 {{T['register']}}</h1>
-        {% if msg %}<p class="msg msg-error">{{msg}}</p>{% endif %}
-        <form method="post">
-            <input name="username" placeholder="Nom d'utilisateur" required>
-            <input name="password" type="password" placeholder="Mot de passe" required>
-            <button class="btn btn-secondary" type="submit">{{T['register']}}</button>
+    <body><div class="container" style="align-items:center;justify-content:center;flex-direction:column;">
+        <h1>📝 Inscription</h1>
+        {% if msg %}<p style="color:#ff6b6b;margin:10px 0;">{{msg}}</p>{% endif %}
+        <form method="post" style="width:300px;">
+            <input name="username" placeholder="Nom d'utilisateur" required
+                   style="width:100%;padding:10px;margin:10px 0;border-radius:5px;border:none;">
+            <input name="password" type="password" placeholder="Mot de passe" required
+                   style="width:100%;padding:10px;margin:10px 0;border-radius:5px;border:none;">
+            <button class="btn" type="submit">S'inscrire</button>
         </form>
     </div></body>
-    """, T=T, msg=msg)
+    """, msg=msg)
 
-@app.route("/menu")
-def menu():
+@app.route("/game")
+def game():
     if 'username' not in session:
         return redirect(url_for("login_page"))
     
-    lang = session.get("lang", "fr")
-    T = LANGUES[lang]
-    state = get_state()
-    current_lord = seigneurs[state['seigneur_actuel']]['nom'] if state['seigneur_actuel'] < len(seigneurs) else "✅ Tous vaincus"
+    if 'game_state' not in session:
+        session['game_state'] = init_game()
+        session.modified = True
     
-    return render_template_string(BASE_STYLE + """
-    <body><div class="container">
-        <h1>🏰 {{T['menu']}}</h1>
-        <div class="stat">
-            💰 {{state['or']}} {{T['gold']}} | 🏆 {{state['seigneur_actuel']}}/{{seigneurs|length}} | 🛡️ {{state['armee']|length}}/{{MAX_ARMEE}}
-        </div>
-        <p style="text-align:center;background:#e74c3c;color:white;padding:10px;border-radius:10px;margin:20px 0;">
-            ⚔️ Prochain adversaire: {{current_lord}}
-        </p>
-        <div style="text-align:center;">
-            <a href="{{url_for('fight')}}"><button class="btn">{{T['fight']}}</button></a>
-            <a href="{{url_for('recruit')}}"><button class="btn">{{T['recruit']}}</button></a>
-            <a href="{{url_for('army_page')}}"><button class="btn">{{T['army']}}</button></a>
-            <a href="{{url_for('sell')}}"><button class="btn">{{T['sell']}}</button></a>
-            <a href="{{url_for('heal_army')}}"><button class="btn">{{T['heal']}}</button></a>
-            <a href="{{url_for('save')}}"><button class="btn">{{T['save']}}</button></a>
-            <a href="{{url_for('quit')}}"><button class="btn btn-secondary">{{T['quit']}}</button></a>
-        </div>
-    </div></body>
-    """, T=T, state=state, current_lord=current_lord, seigneurs=seigneurs, MAX_ARMEE=MAX_ARMEE)
-
-@app.route("/recruit", methods=["GET", "POST"])
-def recruit():
-    if 'username' not in session:
-        return redirect(url_for("login_page"))
+    game_state = session['game_state']
+    player = game_state['players'][0]
     
-    lang = session.get("lang", "fr")
-    T = LANGUES[lang]
-    state = get_state()
-    msg = ""
-    new_unit = None
-    
-    if request.method == "POST":
-        if state['or'] < 60:
-            msg = "❌ Pas assez d'or (60 requis)"
-        elif len(state['armee']) >= MAX_ARMEE:
-            msg = "⚠️ Armée complète (max 6 unités)"
-        else:
-            state['or'] -= 60
-            t = random.randint(1, 100)
-            if t <= 50:
-                nom = random.choice(["Archer", "Fantassin"])
-            elif t <= 70:
-                nom = random.choice(["Chevalier", "Mage"])
-            elif t <= 85:
-                nom = random.choice(["Dragon", "Paladin"])
-            elif t <= 95:
-                nom = random.choice(["Titan", "Archimage"])
-            else:
-                nom = random.choice(["Démon", "Ange Noir"])
+    # Générer la carte HTML
+    map_html = ""
+    for y in range(MAP_SIZE):
+        for x in range(MAP_SIZE):
+            terrain_type = "sea" if game_state['terrain'][y][x] == 0 else "land"
+            owner = game_state['ownership'][y][x]
+            color = game_state['players'][owner]['color'] if owner != -1 else ("#1e3a8a" if terrain_type == "sea" else "#22c55e")
             
-            stats = unite_stats[nom]
-            new_unit = {"nom": nom, "pv": stats["pv"], "pv_max": stats["pv"], 
-                       "attaque": stats["attaque"] + BONUS_ATK[stats["rarete"]], 
-                       "rarete": stats["rarete"], "niveau": 1}
-            state['armee'].append(new_unit)
-            update_state(state)
-            msg = f"✨ Recruté: {nom} ({stats['rarete']}) !"
+            city_class = ""
+            city_key = f"{x},{y}"
+            if city_key in game_state['cities']:
+                city_class = "city"
+            
+            map_html += f'<div class="cell {terrain_type} {city_class}" style="background-color:{color};" onclick="selectCell({x},{y})"></div>'
+    
+    # Classement des joueurs
+    players_sorted = sorted(game_state['players'], key=lambda p: count_territory(game_state, p['id']), reverse=True)
     
     return render_template_string(BASE_STYLE + """
-    <body><div class="container">
-        <h1>🎲 {{T['recruit']}}</h1>
-        <div class="stat">💰 {{state['or']}} {{T['gold']}}</div>
-        {% if msg %}<p class="msg {{'msg-success' if new_unit else 'msg-error'}}">{{msg}}</p>{% endif %}
-        {% if new_unit %}
-        <div class="unit-card rarity-{{new_unit['rarete']}}" style="text-align:center;">
-            <h2>{{new_unit['nom']}}</h2>
-            <p style="color:#e74c3c;font-weight:bold;">{{new_unit['rarete']}} | Niv.{{new_unit['niveau']}}</p>
-            <p>❤️ {{new_unit['pv']}} HP | ⚔️ {{new_unit['attaque']}} ATK</p>
-        </div>
-        {% endif %}
-        <form method="post" style="text-align:center;margin:20px 0;">
-            <button class="btn" type="submit">Recruter une unité (60 or)</button>
-        </form>
-        <div style="background:#ecf0f1;padding:15px;border-radius:10px;margin:20px 0;">
-            <h3 style="color:#2c3e50;">Taux de recrutement:</h3>
-            <p>50% - Commun (Archer, Fantassin)</p>
-            <p>20% - Rare (Chevalier, Mage)</p>
-            <p>15% - Épique (Dragon, Paladin)</p>
-            <p>10% - Légendaire (Titan, Archimage)</p>
-            <p>5% - Mythique (Démon, Ange Noir)</p>
-        </div>
-        <a href="{{url_for('menu')}}"><button class="btn btn-secondary">{{T['back']}}</button></a>
-    </div></body>
-    """, T=T, state=state, msg=msg, new_unit=new_unit)
-
-@app.route("/army")
-def army_page():
-    if 'username' not in session:
-        return redirect(url_for("login_page"))
-    
-    lang = session.get("lang", "fr")
-    T = LANGUES[lang]
-    state = get_state()
-    
-    return render_template_string(BASE_STYLE + """
-    <body><div class="container">
-        <h1>🛡️ {{T['army']}}</h1>
-        {% if state['armee'] %}
-            {% for u in state['armee'] %}
-            <div class="unit-card rarity-{{u['rarete']}}">
-                <h3>{{u['nom']}} <span style="color:#e74c3c;">Niv.{{u['niveau']}}</span></h3>
-                <p style="color:#7f8c8d;">{{u['rarete']}}</p>
-                <div class="health-bar">
-                    <div class="health-fill" style="width:{{(u['pv']/u['pv_max']*100)|int}}%;"></div>
-                </div>
-                <p>❤️ {{u['pv']}}/{{u['pv_max']}} HP | ⚔️ {{u['attaque']}} ATK</p>
+    <body>
+    <div class="container">
+        <div class="sidebar">
+            <h1 style="font-size:1.5em;margin-bottom:20px;">⚔️ OpenFront</h1>
+            
+            <div class="stat">
+                <strong>{{player['name']}}</strong><br>
+                🪖 Troupes: {{player['troops']}}<br>
+                💰 Or: {{player['gold']}}<br>
+                🏴 Territoires: {{player['territory_count']}}
+            </div>
+            
+            <button class="btn" onclick="nextTurn()">▶️ Tour suivant</button>
+            <button class="btn" onclick="location.reload()">🔄 Rafraîchir</button>
+            <button class="btn" onclick="location.href='/save'" style="background:#22c55e;">💾 Sauvegarder</button>
+            <button class="btn" onclick="location.href='/new_game'" style="background:#f5576c;">🆕 Nouvelle partie</button>
+            
+            <h2>🏆 Classement</h2>
+            {% for p in players_sorted[:5] %}
+            <div class="player-item" style="background-color:{{p['color']}}33;border-left:4px solid {{p['color']}};">
+                <span>{{p['name']}}</span>
+                <span>{{count_territory(game_state, p['id'])}} 🏴</span>
             </div>
             {% endfor %}
-        {% else %}
-            <p style="text-align:center;color:#999;margin:40px 0;">Aucune unité dans l'armée</p>
-        {% endif %}
-        <a href="{{url_for('menu')}}"><button class="btn btn-secondary">{{T['back']}}</button></a>
-    </div></body>
-    """, T=T, state=state)
-
-@app.route("/sell", methods=["GET", "POST"])
-def sell():
-    if 'username' not in session:
-        return redirect(url_for("login_page"))
-    
-    lang = session.get("lang", "fr")
-    T = LANGUES[lang]
-    state = get_state()
-    msg = ""
-    
-    if request.method == "POST" and state['armee']:
-        idx = int(request.form["index"])
-        if 0 <= idx < len(state['armee']):
-            unit = state['armee'].pop(idx)
-            prix = PRIX_VENTE[unit['rarete']]
-            state['or'] += prix
-            update_state(state)
-            msg = f"💰 {unit['nom']} vendu pour {prix} or"
-    
-    return render_template_string(BASE_STYLE + """
-    <body><div class="container">
-        <h1>💰 {{T['sell']}}</h1>
-        <div class="stat">💰 {{state['or']}} {{T['gold']}}</div>
-        {% if msg %}<p class="msg msg-success">{{msg}}</p>{% endif %}
-        {% if state['armee'] %}
-            <form method="post">
-                {% for i in range(state['armee']|length) %}
-                {% set u = state['armee'][i] %}
-                <div class="unit-card rarity-{{u['rarete']}}" style="display:flex;justify-content:space-between;align-items:center;">
-                    <div>
-                        <strong>{{u['nom']}}</strong> Niv.{{u['niveau']}} ({{u['rarete']}})
-                    </div>
-                    <button class="btn" name="index" value="{{i}}" type="submit">Vendre {{PRIX_VENTE[u['rarete']]}} or</button>
-                </div>
-                {% endfor %}
-            </form>
-        {% else %}
-            <p style="text-align:center;color:#999;margin:40px 0;">Aucune unité</p>
-        {% endif %}
-        <a href="{{url_for('menu')}}"><button class="btn btn-secondary">{{T['back']}}</button></a>
-    </div></body>
-    """, T=T, state=state, msg=msg, PRIX_VENTE=PRIX_VENTE)
-
-@app.route("/heal_army", methods=["GET", "POST"])
-def heal_army():
-    if 'username' not in session:
-        return redirect(url_for("login_page"))
-    
-    lang = session.get("lang", "fr")
-    T = LANGUES[lang]
-    state = get_state()
-    msg = ""
-    
-    if request.method == "POST":
-        if state['or'] < 40:
-            msg = "❌ Pas assez d'or (40 requis)"
-        else:
-            state['or'] -= 40
-            for u in state['armee']:
-                u['pv'] = u['pv_max']
-            update_state(state)
-            msg = "✨ Armée soignée !"
-    
-    return render_template_string(BASE_STYLE + """
-    <body><div class="container">
-        <h1>❤️ {{T['heal']}}</h1>
-        <div class="stat">💰 {{state['or']}} {{T['gold']}}</div>
-        {% if msg %}<p class="msg {{'msg-success' if '✨' in msg else 'msg-error'}}">{{msg}}</p>{% endif %}
-        <form method="post" style="text-align:center;margin:20px 0;">
-            <button class="btn" type="submit">Soigner toute l'armée (40 or)</button>
-        </form>
-        <a href="{{url_for('menu')}}"><button class="btn btn-secondary">{{T['back']}}</button></a>
-    </div></body>
-    """, T=T, state=state, msg=msg)
-
-@app.route("/fight", methods=["GET", "POST"])
-def fight():
-    if 'username' not in session:
-        return redirect(url_for("login_page"))
-    
-    lang = session.get("lang", "fr")
-    T = LANGUES[lang]
-    state = get_state()
-    
-    if state['seigneur_actuel'] >= len(seigneurs):
-        return render_template_string(BASE_STYLE + """
-        <body><div class="container">
-            <h1>🎊 VICTOIRE TOTALE !</h1>
-            <p style="text-align:center;font-size:1.5em;margin:40px 0;">Tous les seigneurs sont vaincus ! Vous êtes le maître du royaume !</p>
-            <a href="{{url_for('menu')}}"><button class="btn">{{T['back']}}</button></a>
-        </div></body>
-        """, T=T)
-    
-    seigneur = seigneurs[state['seigneur_actuel']]
-    available = [u for u in state['armee'] if u['pv'] > 0]
-    
-    if not available:
-        return render_template_string(BASE_STYLE + """
-        <body><div class="container">
-            <h1>❌ Aucune unité disponible</h1>
-            <p style="text-align:center;margin:20px 0;">Soigne ton armée avant de combattre !</p>
-            <a href="{{url_for('menu')}}"><button class="btn">{{T['back']}}</button></a>
-        </div></body>
-        """, T=T)
-    
-    if request.method == "POST" and 'unit_idx' not in session:
-        idx = int(request.form['unit_idx'])
-        count = 0
-        for i, u in enumerate(state['armee']):
-            if u['pv'] > 0:
-                if count == idx:
-                    session['unit_collection_idx'] = i
-                    break
-                count += 1
+            
+            <h2>ℹ️ Instructions</h2>
+            <p style="font-size:0.85em;line-height:1.4;">
+                • Cliquez sur vos territoires pour construire<br>
+                • Cliquez sur territoires ennemis pour attaquer<br>
+                • Villes: +100 troupes (300 or)<br>
+                • Bateaux: traverser la mer (50 or)<br>
+                • +1 troupe/territoire par tour
+            </p>
+        </div>
         
-        session['enemy_unit'] = random.choice(seigneur['unites'])
-        stats = unite_stats[session['enemy_unit']]
-        session['enemy_pv'] = stats['pv'] + (seigneur['niveau'] * 15)
-        session['enemy_pv_max'] = session['enemy_pv']
-        session['enemy_atk'] = stats['attaque'] + (seigneur['niveau'] * 3)
-        session['combat_log'] = []
-        session.modified = True
-        return redirect(url_for('fight_action'))
+        <div class="map-container">
+            <div class="game-map">
+                {{map_html|safe}}
+            </div>
+        </div>
+    </div>
     
-    return render_template_string(BASE_STYLE + """
-    <body><div class="container">
-        <h1>⚔️ Affronter {{seigneur['nom']}}</h1>
-        <p style="text-align:center;margin:20px 0;font-size:1.2em;">Niveau {{seigneur['niveau']}} | Récompense: {{seigneur['recompense']}} or</p>
-        <h2>{{T['choose_unit']}}</h2>
-        <form method="post">
-            {% for i in range(available|length) %}
-            {% set u = available[i] %}
-            <div class="unit-card rarity-{{u['rarete']}}" style="cursor:pointer;">
-                <button class="btn" name="unit_idx" value="{{i}}" type="submit" style="width:100%;text-align:left;">
-                    <strong>{{u['nom']}}</strong> Niv.{{u['niveau']}} | ❤️ {{u['pv']}}/{{u['pv_max']}} | ⚔️ {{u['attaque']}}
+    <script>
+    let selectedCell = null;
+    
+    function selectCell(x, y) {
+        fetch('/api/select', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({x: x, y: y})
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.action) {
+                if (data.action === 'build_menu') {
+                    showBuildMenu(x, y, data);
+                } else if (data.action === 'attack_menu') {
+                    showAttackMenu(x, y, data);
+                }
+            }
+            if (data.message) alert(data.message);
+        });
+    }
+    
+    function showBuildMenu(x, y, data) {
+        let html = `
+            <div class="overlay" onclick="this.nextElementSibling.remove();this.remove();"></div>
+            <div class="modal">
+                <h2>🏗️ Construire sur (${x},${y})</h2>
+                <p>Troupes: ${data.player_troops} | Or: ${data.player_gold}</p>
+                <button class="btn" onclick="buildCity(${x},${y})">🏰 Ville (300 or → +100 troupes)</button>
+                <button class="btn" onclick="closeModal()" style="background:#f5576c;">Annuler</button>
+            </div>
+        `;
+        document.body.insertAdjacentHTML('beforeend', html);
+    }
+    
+    function showAttackMenu(x, y, data) {
+        let boatText = data.need_boat ? ' + 🚢 Bateau (50 or)' : '';
+        let html = `
+            <div class="overlay" onclick="this.nextElementSibling.remove();this.remove();"></div>
+            <div class="modal">
+                <h2>⚔️ Attaquer (${x},${y})</h2>
+                <p>Défenseur: ${data.defender_name} (${data.defender_troops} troupes)</p>
+                <p>Vos troupes: ${data.player_troops}</p>
+                <input type="number" id="attackTroops" value="100" min="1" max="${data.player_troops}" 
+                       style="width:100%;padding:10px;margin:10px 0;border-radius:5px;border:none;">
+                <button class="btn" onclick="attack(${x},${y}, document.getElementById('attackTroops').value, ${data.need_boat})">
+                    ⚔️ Attaquer${boatText}
                 </button>
+                <button class="btn" onclick="closeModal()" style="background:#f5576c;">Annuler</button>
             </div>
-            {% endfor %}
-        </form>
-        <a href="{{url_for('menu')}}"><button class="btn btn-secondary">{{T['back']}}</button></a>
-    </div></body>
-    """, T=T, seigneur=seigneur, available=available)
+        `;
+        document.body.insertAdjacentHTML('beforeend', html);
+    }
+    
+    function buildCity(x, y) {
+        fetch('/api/build_city', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({x: x, y: y})
+        })
+        .then(r => r.json())
+        .then(data => {
+            alert(data.message);
+            if (data.success) location.reload();
+            else closeModal();
+        });
+    }
+    
+    function attack(x, y, troops, needBoat) {
+        fetch('/api/attack', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({x: x, y: y, troops: parseInt(troops), need_boat: needBoat})
+        })
+        .then(r => r.json())
+        .then(data => {
+            alert(data.message);
+            location.reload();
+        });
+    }
+    
+    function nextTurn() {
+        fetch('/api/next_turn', {method: 'POST'})
+        .then(r => r.json())
+        .then(data => {
+            alert(data.message);
+            location.reload();
+        });
+    }
+    
+    function closeModal() {
+        document.querySelector('.overlay')?.remove();
+        document.querySelector('.modal')?.remove();
+    }
+    </script>
+    </body>
+    """, map_html=map_html, player=player, game_state=game_state, 
+         players_sorted=players_sorted, count_territory=count_territory)
 
-@app.route("/fight_action", methods=["GET", "POST"])
-def fight_action():
-    if 'username' not in session or 'unit_collection_idx' not in session:
-        return redirect(url_for("fight"))
+@app.route("/api/select", methods=["POST"])
+def api_select():
+    data = request.json
+    x, y = data['x'], data['y']
+    game = session['game_state']
+    owner = game['ownership'][y][x]
+    player = game['players'][0]
     
-    lang = session.get("lang", "fr")
-    T = LANGUES[lang]
-    state = get_state()
-    seigneur = seigneurs[state['seigneur_actuel']]
-    unit = state['armee'][session['unit_collection_idx']]
+    if owner == 0:  # Notre territoire
+        return jsonify({
+            "action": "build_menu",
+            "player_troops": player['troops'],
+            "player_gold": player['gold']
+        })
+    elif owner != -1:  # Territoire ennemi
+        defender = game['players'][owner]
+        
+        # Vérifier si on a un territoire adjacent
+        has_adjacent = False
+        for nx, ny in get_neighbors(x, y):
+            if game['ownership'][ny][nx] == 0:
+                has_adjacent = True
+                # Vérifier si on a besoin d'un bateau
+                need_boat = game['terrain'][ny][nx] == 1 and game['terrain'][y][x] == 1 and not are_connected_by_land(game, nx, ny, x, y)
+                break
+        
+        if not has_adjacent:
+            return jsonify({"message": "Pas de territoire adjacent pour attaquer !"})
+        
+        return jsonify({
+            "action": "attack_menu",
+            "defender_name": defender['name'],
+            "defender_troops": defender['troops'],
+            "player_troops": player['troops'],
+            "need_boat": need_boat
+        })
     
-    if request.method == "POST":
-        action = request.form['action']
-        log = session.get('combat_log', [])
-        
-        if action == "attack":
-            dmg = random.randint(unit['attaque']-8, unit['attaque']+8)
-            if random.randint(1,100) <= 20:
-                dmg = int(dmg * 1.8)
-                log.append(f"💥 {unit['nom']} COUP CRITIQUE: -{dmg}")
-            else:
-                log.append(f"⚔️ {unit['nom']}: -{dmg}")
-            session['enemy_pv'] = max(0, session['enemy_pv'] - dmg)
-        elif action == "heal":
-            heal = int(unit['pv_max'] * 0.5)
-            unit['pv'] = min(unit['pv_max'], unit['pv'] + heal)
-            log.append(f"💚 {unit['nom']}: +{heal} HP")
-        
-        if session['enemy_pv'] > 0:
-            if random.randint(1,100) <= 25:
-                heal = int(session['enemy_pv_max'] * 0.4)
-                session['enemy_pv'] = min(session['enemy_pv_max'], session['enemy_pv'] + heal)
-                log.append(f"💚 {session['enemy_unit']}: +{heal} HP")
-            else:
-                dmg = random.randint(session['enemy_atk']-8, session['enemy_atk']+8)
-                if random.randint(1,100) <= 20:
-                    dmg = int(dmg * 1.8)
-                    log.append(f"⚡ {session['enemy_unit']} COUP CRITIQUE: -{dmg}")
-                else:
-                    log.append(f"🔥 {session['enemy_unit']}: -{dmg}")
-                unit['pv'] = max(0, unit['pv'] - dmg)
-        
-        session['combat_log'] = log[-6:]
-        session.modified = True
-        update_state(state)
-        
-        if unit['pv'] <= 0 or session['enemy_pv'] <= 0:
-            return redirect(url_for('fight_result'))
-    
-    return render_template_string(BASE_STYLE + """
-    <body><div class="container">
-        <h1>⚔️ Combat vs {{seigneur['nom']}}</h1>
-        <div class="stat">
-            💰 {{state['or']}} or | Ennemi: {{session['enemy_unit']}} ({{session['enemy_pv']}}/{{session['enemy_pv_max']}} HP)
-        </div>
-        <div class="unit-card rarity-{{unit['rarete']}}">
-            <h3>{{unit['nom']}} (Niv.{{unit['niveau']}})</h3>
-            <div class="health-bar">
-                <div class="health-fill" style="width:{{(unit['pv']/unit['pv_max']*100)|int}}%;"></div>
-            </div>
-            <p>❤️ {{unit['pv']}}/{{unit['pv_max']}} HP | ⚔️ {{unit['attaque']}} ATK</p>
-        </div>
-        <div style="background:#ecf0f1;padding:15px;border-radius:10px;margin:20px 0;">
-            <h3 style="color:#2c3e50;">📜 Journal de combat:</h3>
-            {% for entry in session.get('combat_log', []) %}
-                <p style="margin:5px 0;">{{entry}}</p>
-            {% endfor %}
-        </div>
-        <form method="post" style="text-align:center;">
-            <button class="btn" name="action" value="attack" type="submit">{{T['attack']}}</button>
-            <button class="btn btn-secondary" name="action" value="heal" type="submit">{{T['heal_action']}}</button>
-        </form>
-        <a href="{{url_for('menu')}}"><button class="btn" style="background:#95a5a6;">Abandonner</button></a>
-    </div></body>
-    """, T=T, seigneur=seigneur, unit=unit, session=session, state=state)
+    return jsonify({"message": "Territoire neutre - utilisez l'attaque depuis un territoire adjacent"})
 
-@app.route("/fight_result")
-def fight_result():
-    if 'username' not in session or 'unit_collection_idx' not in session:
-        return redirect(url_for("fight"))
+@app.route("/api/build_city", methods=["POST"])
+def api_build_city():
+    data = request.json
+    x, y = data['x'], data['y']
+    game = session['game_state']
+    player = game['players'][0]
     
-    lang = session.get("lang", "fr")
-    T = LANGUES[lang]
-    state = get_state()
-    seigneur = seigneurs[state['seigneur_actuel']]
-    unit = state['armee'][session['unit_collection_idx']]
+    city_key = f"{x},{y}"
+    if city_key in game['cities']:
+        return jsonify({"success": False, "message": "❌ Ville déjà construite ici !"})
     
-    won = session['enemy_pv'] <= 0
-    if won:
-        state['or'] += seigneur['recompense']
-        state['seigneur_actuel'] += 1
-        unit['niveau'] += 1
-        unit['attaque'] += 5
-        unit['pv_max'] += 20
-        unit['pv'] = unit['pv_max']
-        msg = f"{T['victory']} +{seigneur['recompense']} or ! {unit['nom']} monte au niveau {unit['niveau']} !"
-        cls = "msg-success"
-    else:
-        msg = T['defeat']
-        cls = "msg-error"
+    if player['gold'] < 300:
+        return jsonify({"success": False, "message": "❌ Pas assez d'or (300 requis)"})
     
-    update_state(state)
-    
-    # Clean up session
-    keys_to_clear = ['unit_collection_idx', 'enemy_unit', 'enemy_pv', 'enemy_pv_max', 'enemy_atk', 'combat_log']
-    for k in keys_to_clear:
-        session.pop(k, None)
+    player['gold'] -= 300
+    player['troops'] += 100
+    game['cities'][city_key] = {"owner": 0, "level": 1}
     session.modified = True
     
-    return render_template_string(BASE_STYLE + """
-    <body><div class="container">
-        <h1>{% if won %}{{T['victory']}}{% else %}{{T['defeat']}}{% endif %}</h1>
-        <p class="msg {{cls}}">{{msg}}</p>
-        <div class="unit-card rarity-{{unit['rarete']}}">
-            <h3>{{unit['nom']}}</h3>
-            <p>❤️ {{unit['pv']}}/{{unit['pv_max']}} HP | ⚔️ {{unit['attaque']}} ATK | ⭐ Niveau {{unit['niveau']}}</p>
-        </div>
-        {% if won and state['seigneur_actuel'] < seigneurs|length %}
-        <p style="text-align:center;margin:20px 0;font-size:1.1em;">
-            Prochain adversaire: <strong>{{seigneurs[state['seigneur_actuel']]['nom']}}</strong> (Niveau {{seigneurs[state['seigneur_actuel']]['niveau']}})
-        </p>
-        {% endif %}
-        <a href="{{url_for('menu')}}"><button class="btn">{{T['menu']}}</button></a>
-    </div></body>
-    """, T=T, won=won, msg=msg, cls=cls, unit=unit, state=state, seigneurs=seigneurs)
+    return jsonify({"success": True, "message": "✅ Ville construite ! +100 troupes"})
 
-@app.route("/save")
-def save():
-    if 'username' not in session:
-        return redirect(url_for("login_page"))
-    save_game(session['username'], get_state())
-    return redirect(url_for("menu"))
+@app.route("/api/attack", methods=["POST"])
+def api_attack():
+    data = request.json
+    x, y = data['x'], data['y']
+    troops = data['troops']
+    need_boat = data['need_boat']
+    
+    game = session['game_state']
+    player = game['players'][0]
+    
+    if troops > player['troops']:
+        return jsonify({"message": "❌ Pas assez de troupes !"})
+    
+    if need_boat and player['gold'] < 50:
+        return jsonify({"message": "❌ Pas assez d'or pour le bateau (50 requis)"})
+    
+    if need_boat:
+        player['gold'] -= 50
+    
+    # Trouver notre territoire adjacent
+    from_x, from_y = None, None
+    for nx, ny in get_neighbors(x, y):
+        if game['ownership'][ny][nx] == 0:
+            from_x, from_y = nx, ny
+            break
+    
+    perform_attack(game, 0, from_x, from_y, x, y, troops)
+    session.modified = True
+    
+    return jsonify({"message": "⚔️ Attaque effectuée !"})
 
-@app.route("/quit")
-def quit():
-    session.clear()
-    return redirect(url_for("home"))
-
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+@app.route("/api/next_turn", methods=["POST"])
+def api_next_turn():
+    game = session['game_state']
+    game['turn'] += 1
+    
+    # Tour du joueur
+    player = game['players'][0]
+    player['territory_count'] = count_territory(game, 0)
+    player['troops'] += player['territory_count']
+    player['gold'] += player['territory_count'] // 10
