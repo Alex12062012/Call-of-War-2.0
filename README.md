@@ -2,6 +2,8 @@
 
 > C'est l'un de mes premiers jeux : un jeu de stratégie et de conquête au tour par tour, inspiré d'[OpenFront](https://openfront.io), que j'ai refait en Python.
 
+▶ **Jouer en ligne :** https://call-of-war-2-3.onrender.com (hébergé gratuitement sur Render : le premier chargement peut prendre une minute)
+
 ![La carte après quelques tours](docs/carte.jpg)
 
 ## Le jeu
